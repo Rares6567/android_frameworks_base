@@ -39,16 +39,25 @@ import android.annotation.ColorInt;
 import android.annotation.NonNull;
 import android.annotation.Nullable;
 import android.app.WindowConfiguration;
+import android.graphics.BitmapShader;
+import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Insets;
+import android.graphics.Paint;
+import android.graphics.PixelFormat;
 import android.graphics.Rect;
+import android.graphics.Shader;
 import android.util.SparseArray;
 import android.view.InsetsSource;
 import android.view.InsetsState;
+import android.view.Surface;
 import android.view.SurfaceControl;
 import android.view.WindowManager;
 import android.view.animation.AlphaAnimation;
 import android.view.animation.Animation;
+import android.view.animation.Transformation;
+import android.window.ScreenCapture.ScreenCaptureParams;
+import android.window.ScreenCaptureInternal;
 import android.window.TransitionInfo;
 
 import com.android.internal.R;
@@ -326,6 +335,115 @@ public class TransitionAnimationHelper {
                 .setColor(animationBackgroundSurface, colorArray)
                 .show(animationBackgroundSurface);
         finishTransaction.remove(animationBackgroundSurface);
+    }
+
+    /**
+     * Adds edge extension surface to the given {@code change} for edge extension animation.
+     */
+    public static void edgeExtendWindow(@NonNull TransitionInfo.Change change,
+            @NonNull Animation a, @NonNull SurfaceControl.Transaction startTransaction,
+            @NonNull SurfaceControl.Transaction finishTransaction) {
+        final Transformation transformationAtStart = new Transformation();
+        a.getTransformationAt(0, transformationAtStart);
+        final Transformation transformationAtEnd = new Transformation();
+        a.getTransformationAt(1, transformationAtEnd);
+
+        // Create an extension surface at the maximal size; the animation will crop overflow.
+        final Insets maxExtensionInsets = Insets.min(
+                transformationAtStart.getInsets(), transformationAtEnd.getInsets());
+
+        final int targetSurfaceHeight = Math.max(change.getStartAbsBounds().height(),
+                change.getEndAbsBounds().height());
+        final int targetSurfaceWidth = Math.max(change.getStartAbsBounds().width(),
+                change.getEndAbsBounds().width());
+        if (maxExtensionInsets.left < 0) {
+            final Rect edgeBounds = new Rect(0, 0, 1, targetSurfaceHeight);
+            final Rect extensionRect = new Rect(0, 0,
+                    -maxExtensionInsets.left, targetSurfaceHeight);
+            createExtensionSurface(change.getLeash(), edgeBounds, extensionRect,
+                    maxExtensionInsets.left, 0, "Left Edge Extension", startTransaction,
+                    finishTransaction);
+        }
+
+        if (maxExtensionInsets.top < 0) {
+            final Rect edgeBounds = new Rect(0, 0, targetSurfaceWidth, 1);
+            final Rect extensionRect = new Rect(0, 0,
+                    targetSurfaceWidth, -maxExtensionInsets.top);
+            createExtensionSurface(change.getLeash(), edgeBounds, extensionRect,
+                    0, maxExtensionInsets.top, "Top Edge Extension", startTransaction,
+                    finishTransaction);
+        }
+
+        if (maxExtensionInsets.right < 0) {
+            final Rect edgeBounds = new Rect(targetSurfaceWidth - 1, 0,
+                    targetSurfaceWidth, targetSurfaceHeight);
+            final Rect extensionRect = new Rect(0, 0,
+                    -maxExtensionInsets.right, targetSurfaceHeight);
+            createExtensionSurface(change.getLeash(), edgeBounds, extensionRect,
+                    targetSurfaceWidth, 0, "Right Edge Extension", startTransaction,
+                    finishTransaction);
+        }
+
+        if (maxExtensionInsets.bottom < 0) {
+            final Rect edgeBounds = new Rect(0, targetSurfaceHeight - 1,
+                    targetSurfaceWidth, targetSurfaceHeight);
+            final Rect extensionRect = new Rect(0, 0,
+                    targetSurfaceWidth, -maxExtensionInsets.bottom);
+            createExtensionSurface(change.getLeash(), edgeBounds, extensionRect,
+                    0, targetSurfaceHeight, "Bottom Edge Extension", startTransaction,
+                    finishTransaction);
+        }
+    }
+
+    private static SurfaceControl createExtensionSurface(@NonNull SurfaceControl surfaceToExtend,
+            @NonNull Rect edgeBounds, @NonNull Rect extensionRect, int xPos, int yPos,
+            @NonNull String layerName, @NonNull SurfaceControl.Transaction startTransaction,
+            @NonNull SurfaceControl.Transaction finishTransaction) {
+        final SurfaceControl edgeExtensionLayer = new SurfaceControl.Builder()
+                .setName(layerName)
+                .setParent(surfaceToExtend)
+                .setHidden(true)
+                .setCallsite("TransitionAnimationHelper#createExtensionSurface")
+                .setOpaque(true)
+                .setBufferSize(extensionRect.width(), extensionRect.height())
+                .build();
+
+        final ScreenCaptureInternal.LayerCaptureArgs captureArgs =
+                new ScreenCaptureInternal.LayerCaptureArgs.Builder(surfaceToExtend)
+                        .setSourceCrop(edgeBounds)
+                        .setPixelFormat(PixelFormat.RGBA_8888)
+                        .setChildrenOnly(true)
+                        .setSecureContentPolicy(
+                                ScreenCaptureParams.SECURE_CONTENT_POLICY_CAPTURE)
+                        .setProtectedContentPolicy(
+                                ScreenCaptureParams.PROTECTED_CONTENT_POLICY_CAPTURE)
+                        .setPreserveDisplayColors(true)
+                        .build();
+        final ScreenCaptureInternal.ScreenshotHardwareBuffer edgeBuffer =
+                ScreenCaptureInternal.captureLayers(captureArgs);
+
+        if (edgeBuffer == null) {
+            ProtoLog.e(ShellProtoLogGroup.WM_SHELL_TRANSITIONS,
+                    "Failed to capture edge of window.");
+            return null;
+        }
+
+        final BitmapShader shader = new BitmapShader(edgeBuffer.asBitmap(),
+                Shader.TileMode.CLAMP, Shader.TileMode.CLAMP);
+        final Paint paint = new Paint();
+        paint.setShader(shader);
+
+        final Surface surface = new Surface(edgeExtensionLayer);
+        final Canvas canvas = surface.lockHardwareCanvas();
+        canvas.drawRect(extensionRect, paint);
+        surface.unlockCanvasAndPost(canvas);
+        surface.release();
+
+        startTransaction.setLayer(edgeExtensionLayer, Integer.MIN_VALUE);
+        startTransaction.setPosition(edgeExtensionLayer, xPos, yPos);
+        startTransaction.setVisibility(edgeExtensionLayer, true);
+        finishTransaction.remove(edgeExtensionLayer);
+        return edgeExtensionLayer;
     }
 
     /**

@@ -67,6 +67,7 @@ import static com.android.internal.policy.TransitionAnimation.WALLPAPER_TRANSITI
 import static com.android.internal.policy.TransitionAnimation.WALLPAPER_TRANSITION_OPEN;
 import static com.android.wm.shell.Flags.enableDynamicInsetsForAppLaunch;
 import static com.android.wm.shell.transition.DefaultSurfaceAnimator.buildSurfaceAnimation;
+import static com.android.wm.shell.transition.TransitionAnimationHelper.edgeExtendWindow;
 import static com.android.wm.shell.transition.TransitionAnimationHelper.getTransitionBackgroundColorIfSet;
 import static com.android.wm.shell.transition.TransitionAnimationHelper.getTransitionTypeFromInfo;
 import static com.android.wm.shell.transition.TransitionAnimationHelper.isCoveredByOpaqueFullscreenChange;
@@ -121,7 +122,9 @@ import com.android.wm.shell.shared.animation.Interpolators;
 import com.android.wm.shell.sysui.ShellInit;
 
 import java.util.ArrayList;
+import java.util.List;
 import java.util.NoSuchElementException;
+import java.util.function.Consumer;
 
 /** The default handler that handles anything not already handled. */
 public class DefaultTransitionHandler implements Transitions.TransitionHandler {
@@ -378,6 +381,8 @@ public class DefaultTransitionHandler implements Transitions.TransitionHandler {
             }
             finishCallback.onTransitionFinished(null /* wct */);
         };
+        final List<Consumer<SurfaceControl.Transaction>> postStartTransactionCallbacks =
+                new ArrayList<>();
 
         @ColorInt int backgroundColorForTransition = 0;
         final int wallpaperTransit = getWallpaperTransitType(info);
@@ -605,9 +610,14 @@ public class DefaultTransitionHandler implements Transitions.TransitionHandler {
                 if (!isTask && a.getExtensionEdges() != 0x0
                         && (change.hasFlags(FLAG_FILLS_TASK
                         | FLAG_IN_TASK_WITH_EMBEDDED_ACTIVITY))) {
-                    startTransaction.setEdgeExtensionEffect(
-                            change.getLeash(), a.getExtensionEdges());
-                    finishTransaction.setEdgeExtensionEffect(change.getLeash(), /* edge */ 0);
+                    if (!TransitionUtil.isOpeningType(mode)) {
+                        // Can screenshot before startTransaction is applied.
+                        edgeExtendWindow(change, a, startTransaction, finishTransaction);
+                    } else {
+                        // Opening changes may not be visible until after the start transaction.
+                        postStartTransactionCallbacks
+                                .add(t -> edgeExtendWindow(change, a, t, finishTransaction));
+                    }
                 }
 
                 if (isActivity && !isActivityLevel
@@ -652,6 +662,13 @@ public class DefaultTransitionHandler implements Transitions.TransitionHandler {
                     finishTransaction);
         }
 
+        if (!postStartTransactionCallbacks.isEmpty()) {
+            // These callbacks depend on the start transaction already being visible.
+            startTransaction.apply(true /* sync */);
+            for (Consumer<SurfaceControl.Transaction> callback : postStartTransactionCallbacks) {
+                callback.accept(startTransaction);
+            }
+        }
         startTransaction.apply();
 
         final boolean hasAnimations = !animations.isEmpty();
